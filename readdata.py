@@ -3,8 +3,27 @@ from pytorch_transformers import BertTokenizer
 ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 
 
+def is_english(character):
+    if 'A' <= character and character <= 'Z':
+        return True
+    if 'Ａ' <= character and character <= 'Ｚ':
+        return True
+    if 'a' <= character and character <= 'z':
+        return True
+    if 'ａ' <= character and character <= 'ｚ':
+        return True
+    if '0' <= character and character <= '9':
+        return True
+    if '０' <= character and character <= '９':
+        return True
+    if character == '○':
+        return True
+    if character == '.' or character == '．' or character == '%' or character == '％':
+        return True
+    return False
 
-def read_from_training_data(filename):
+
+def read_from_training_data(characters, filter_fn = lambda x: len(x) <= 1):
     """
     Reads a file containing tokenized Chinese plaintext. 
     
@@ -18,8 +37,9 @@ def read_from_training_data(filename):
     insert sentence breaks if a sentence exceeds 300 characters. 
     
     """    
-    characters = open(filename).read()
+    #characters = open(filename).read()
     #x_list is a list of sentences, which means x_list is a 2-d array
+    characters = list(characters)
     sentence_cnt = 0
     x_list = [[]]
     y_list = [[]]
@@ -47,10 +67,9 @@ def read_from_training_data(filename):
                 sentence_cnt += 1
                 x_list.append([])
                 y_list.append([])
-    print(len(x_list))
-    print(alpha_count)
-    print(len(characters))
-    return zip(x_list, y_list)
+    sents = [x_list[i] for i in range(len(x_list)) if not filter_fn(x_list[i])]
+    flags = [y_list[i] for i in range(len(y_list)) if not filter_fn(x_list[i])]
+    return sents, flags
 
  
 def read_from_testing_data(filename):
@@ -81,17 +100,6 @@ def read_from_testing_data(filename):
     x_list = [x for x in x_list if len(x) > 0]
     return x_list
 
-def SentencesReader(filename, file_type):
-    """
-    Dispatcher function for read_from_training_data and read_from_testing_data.
-    
-    """
-    assert(file_type == 'testing' or file_type == 'training')
-    if(file_type == 'testing'):
-        return read_from_testing_data(filename)
-    if(file_type == 'training'):
-        x_list, _ = read_from_training_data(filename)
-        return x_list
     
 def ReadEnglish(filename):
     characters = open(filename).read()
