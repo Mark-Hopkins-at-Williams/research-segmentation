@@ -3,83 +3,20 @@ import random
 from util import cudaify, clear_cuda
 from transformers import BertTokenizer, BertModel
 from networks import DropoutClassifier
-from readdata import read_from_training_data, read_from_testing_data, is_english
-
-class Embedder:
-
-    def __init__(self, base_embedding_width):
-        self.base_embedding_width = base_embedding_width
-
-    def embedding_width(self):
-        raise NotImplementedError("Cannot call a generic Embedder.")
-    
-    def __call__(self, layers, i):
-        raise NotImplementedError("Cannot call a generic Embedder.")
-
-class SimpleEmbedder(Embedder):
-    def __init__(self, base_embedding_width):
-        super().__init__(base_embedding_width)
-
-    def embedding_width(self):
-        return self.base_embedding_width
-
-    def __call__(self, layers, i):
-        means = []
-        for w in range(1):
-            mean = (layers[0][0][i + w] + layers[12][0][i + w]) / 2
-            means.append(mean)
-        return torch.unsqueeze(torch.cat(means, 0), 0)
-
-class GapEmbedder(Embedder):
-    def __init__(self, base_embedding_width):
-        super().__init__(base_embedding_width)
-
-    def embedding_width(self):
-        return 2 * self.base_embedding_width
-
-    def __call__(self, layers, i):
-        means = []
-        for w in range(2):
-            mean = (layers[0][0][i + w] + layers[12][0][i + w]) / 2
-            means.append(mean)
-        result = torch.unsqueeze(torch.cat(means, 0), 0)
-        return result
-
-class GapAverageEmbedder(Embedder):
-    def __init__(self, base_embedding_width):
-        super().__init__(base_embedding_width)
-
-    def embedding_width(self):
-        return self.base_embedding_width
-
-    def __call__(self, layers, i):
-        mean = (layers[0][0][i] + layers[12][0][i] + layers[0][0][i+1] + layers[12][0][i+1]) / 4
-        result = torch.unsqueeze(mean, 0)
-        return result
-
-class WideEmbedder(Embedder):
-    def __init__(self, base_embedding_width):
-        super().__init__(base_embedding_width)
-        
-    def embedding_width(self):
-        return 4 * self.base_embedding_width
-
-    def __call__(self, layers, i):
-        means = []
-        for w in range(-1, 3):
-            mean = (layers[0][0][i + w] + layers[12][0][i + w]) / 2
-            means.append(mean)
-        return torch.unsqueeze(torch.cat(means, 0), 0)
-
+from readdata import read_train_data
+from segmenter import segment_file, XE, BMES
+from embed import GapEmbedder
+from embed import SimpleEmbedder, GapAverageEmbedder, WideEmbedder
 
 
 class BertForWordSegmentation(torch.nn.Module):
-    def __init__(self, embedder):
+    def __init__(self, embedder, encoding, bert_model = 'bert-base-multilingual-cased'):
         super(BertForWordSegmentation, self).__init__()
         self.embedder = embedder
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased', do_lower_case = False)
-        self.model = cudaify(BertModel.from_pretrained('bert-base-multilingual-cased', output_hidden_states=True))
-        self.classifier = cudaify(DropoutClassifier(self.embedder.embedding_width(), 2))
+        self.encoding = encoding
+        self.tokenizer = BertTokenizer.from_pretrained(bert_model, do_lower_case = False)
+        self.model = cudaify(BertModel.from_pretrained(bert_model, output_hidden_states=True))
+        self.classifier = cudaify(DropoutClassifier(self.embedder.embedding_width(), self.encoding.domain_size()))
         
     def forward(self, input_tokens, labels = None):
         bert_tokens = []
@@ -103,9 +40,17 @@ class BertForWordSegmentation(torch.nn.Module):
             loss = loss_fct(result, y)
         return result, loss
     
+    def segmenter(self):
+        def segment(sent):
+            z, _ = self([tok for tok in sent])
+            flags = []
+            for i in range(len(z)):
+                flags.append(z[i].argmax().item())                
+            flags.append(self.encoding.terminator())
+            return flags
+        return segment
+                
     
-
-
 def data_loader(x_list, y_list):
     z = list(zip(x_list, y_list))
     random.shuffle(z)
@@ -114,12 +59,14 @@ def data_loader(x_list, y_list):
     for i in range(len(x_tuple)):
         yield x_tuple[i], y_tuple[i]
 
+
 def train(x_train, y_train, x_dev, y_dev, model, num_epochs, learning_rate, 
-          do_save, save_path, eliminate_one):
+          save_path):
     best_model = model
     best_acc = 0.0
     
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters())#, lr=learning_rate)
+    print("Starting first epoch...")
     for epoch in range(num_epochs):
         train_loader = data_loader(x_train, y_train)
         test_loader = data_loader(x_dev, y_dev)
@@ -147,116 +94,93 @@ def train(x_train, y_train, x_dev, y_dev, model, num_epochs, learning_rate,
             best_acc = correct_predictions * 1.0 / num_characters
             best_model = model
         clear_cuda()
-    if do_save:
+    if save_path is not None:
         torch.save(best_model, save_path)
     return best_model
 
 
-
-def segment_test_file(model, test_file, 
-                      output_filename = 'result.txt'):
-    characters = open(test_file).read()   
-    characters = [ch for ch in characters if ch != ' ']
-    x_list = read_from_testing_data(test_file)    
-    output = open(output_filename, "w+")
-    sentence_id = 0
-    token_id = 0
-    character_id = 0
-    for j, tokens in enumerate(x_list):
-        if j % 100 == 0:
-            print('{}/{}'.format(j, len(x_list)))
-        if len(tokens) > 1:
-            z, loss = model(tokens)
-
-        for i, tok in enumerate(tokens):
-            # if this is the last token:
-            if i == len(tokens) - 1:
-                output.write(characters[character_id])
-                output.write("  ")
-                if characters[character_id + 1] == '\n':
-                    output.write("\n")
-                    character_id += 1
-                token_id = 0
-                sentence_id += 1
-                character_id += 1
-            else:
-                output.write(characters[character_id])                
-                if z[i].argmax().item() == 1:
-                    output.write("  ")
-                token_id += 1
-                character_id += 1
-    if character_id < len(characters):
-        output.write(characters[character_id])
-    output.write("  \n")
-    output.close()  
-    
-    
-def character_stream(filename, num_lines):
+def line_stream(filename, num_lines):
     with open(filename) as inhandle:
         for i in range(num_lines):
             line = inhandle.readline()
-            for char in line:
-                yield char
+            yield line.strip()
         
-def main(train_file, dev_file, num_sentences, window_size=2, 
-         num_epochs = 15, learning_rate = 0.005, do_save = True, 
-         save_path = 'FineTuneModel.bin', eliminate_one = True):
-    
-    BERT_EMBEDDING_WIDTH = 768
-    x_train, y_train = read_from_training_data(character_stream(train_file, num_sentences))
-    x_dev, y_dev = read_from_training_data(character_stream(dev_file, num_sentences))
-    model = BertForWordSegmentation(GapAverageEmbedder(BERT_EMBEDDING_WIDTH))
-    net = train(x_train, y_train, x_dev, y_dev, model, num_epochs, learning_rate, 
-                do_save, save_path, eliminate_one)
-    segment_test_file(net, dev_file, 'result.txt')
-    clear_cuda()
-
-def prepare_script(model_path, test_file, output_filename = 'FineTune_result.txt'):
-    model = torch.load(model_path)
-    
-    test_chars = open(test_file).read()
-    characters = []
-    hash_string = ""
-    for c in test_chars:
-        if is_english(c):
-            hash_string += c
-        else:
-            if hash_string != "":
-                characters.append(hash_string)
-                hash_string = ""        
-            characters.append(c)
+def main(train_file, dev_file, test_file):
+   
+    def run_experiment(num_sentences, 
+                       text_output_file,
+                       embedder,
+                       encoding,
+                       model_file = 'FineTuneModel.bin', 
+                       num_epochs = 15, 
+                       learning_rate = 0.005):
             
-    x_list = read_from_testing_data(test_file)
-    output = open(output_filename, "w+")
+        model = BertForWordSegmentation(embedder, encoding)
+        x_train, y_train = read_train_data(line_stream(train_file, num_sentences), encoding)
+        x_dev, y_dev = read_train_data(line_stream(dev_file, num_sentences), encoding)
+        net = train(x_train, y_train, x_dev, y_dev, model, num_epochs, learning_rate, 
+                    model_file)
+        segment_file(net, test_file, text_output_file)
+        clear_cuda()
 
-    character_id = 0
-    for x in x_list:
-        if len(x) == 0:
-            print("Error! Sentecen with length 0!")
-            continue
-        if len(x) > 1:
-            z, _ = model(x)
-    #        print(z)
-    #        print(z.argmax())
-            for (i, prediction) in enumerate(z):
-                output.write(characters[character_id])
-                if prediction.argmax().item() == 1:
-                    output.write("  ")
-                character_id += 1
-        output.write(characters[character_id])
-        character_id += 1
-#       print("space: %d %c" % (character_id, characters[character_id]))
-        output.write("  ")
-        if characters[character_id] == '\n':
-#                print("end of line: %d %d %d" % (sentence_id, token_id, character_id)).
-            output.write("\n")
-            character_id += 1
-    torch.cuda.empty_cache()
-    output.close()    
+    BERT_EMBEDDING_WIDTH = 768
+    run_experiment(2000, 'gap.2k.xe.txt', 
+                   GapEmbedder(BERT_EMBEDDING_WIDTH),
+                   XE(),
+                   model_file = None,
+                   num_epochs = 10)
+    """
+    run_experiment(2000, 'gap.2k.bmes.txt', 
+                   GapEmbedder(BERT_EMBEDDING_WIDTH),
+                   BMES(),
+                   model_file = None,
+                   num_epochs = 10)
+    run_experiment(18500, 'gap.19k.xe.txt', 
+                   GapEmbedder(BERT_EMBEDDING_WIDTH),
+                   XE(),
+                   model_file = 'gap.19k.xe.bin',
+                   num_epochs = 10)                   
+    run_experiment(18500, 'gap.19k.bmes.txt', 
+                   GapEmbedder(BERT_EMBEDDING_WIDTH),
+                   BMES(),
+                   model_file = 'gap.19k.bmes.bin',
+                   num_epochs = 10)                   
+    run_experiment(18500, 'wide.19k.xe.txt', 
+                   WideEmbedder(BERT_EMBEDDING_WIDTH),
+                   XE(),
+                   model_file = 'wide.19k.xe.bin',
+                   num_epochs = 10)                   
+    run_experiment(18500, 'wide.19k.bmes.txt', 
+                   WideEmbedder(BERT_EMBEDDING_WIDTH),
+                   BMES(),
+                   model_file = 'wide.19k.bmes.bin',
+                   num_epochs = 10)                   
+    run_experiment(18500, 'simple.19k.xe.txt', 
+                   SimpleEmbedder(BERT_EMBEDDING_WIDTH),
+                   XE(),
+                   model_file = 'simple.19k.xe.bin',
+                   num_epochs = 10)
+    run_experiment(18500, 'simple.19k.bmes.txt', 
+                   SimpleEmbedder(BERT_EMBEDDING_WIDTH),
+                   BMES(),
+                   model_file = 'simple.19k.bmes.bin',
+                   num_epochs = 10)
+    run_experiment(18500, 'gapavg.19k.xe.txt', 
+                   GapAverageEmbedder(BERT_EMBEDDING_WIDTH),
+                   XE(),
+                   model_file = 'gapavg.19k.xe.bin',
+                   num_epochs = 10)                   
+    run_experiment(18500, 'gapavg.19k.bmes.txt', 
+                   GapAverageEmbedder(BERT_EMBEDDING_WIDTH),
+                   BMES(),
+                   model_file = 'gapavg.19k.bmes.bin',
+                   num_epochs = 10)     
+    """
+
+
     
 if __name__ == '__main__':
-    prepare_script('/home/hopkinsm/Projects/research/research-segmentation/FineTuneModel.bin',  '../../research/research-segmentation/data/bakeoff/testing/pku_test.utf8', 'foo.txt')
-    #net = main('data/bakeoff/training/pku_training.utf8', 
-    #           'data/bakeoff/testing/pku_test.utf8',
-    #           num_sentences = 19000)
+    net = main('data/bakeoff/training/pku_training.utf8', 
+               'pku_dev.utf8',               
+               'data/bakeoff/testing/pku_test.utf8')
     
